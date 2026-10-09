@@ -58,12 +58,19 @@ function main() {
   const storms = mergeStorms_(intervals);
   const cal = getCalendar_();
 
-  storms.forEach(s => upsertEvent_(cal, s));
-  addScaleDays_(cal, storms);
+  // каждое событие в своём try/catch: одна ошибка не должна блокировать остальные
+  let ok = 0;
+  storms.forEach(s => {
+    try { upsertEvent_(cal, s); ok++; }
+    catch (e) { Logger.log('Ошибка события %s: %s', localStr_(s.start), e.message); }
+  });
+  try { addScaleDays_(cal, storms); }
+  catch (e) { Logger.log('Ошибка суточных оценок: %s', e.message); }
 
   const maxKp = intervals.reduce((m, i) => Math.max(m, i.kp), 0);
-  Logger.log('Интервалов в данных: %s | макс. Kp в данных: %s | порог: %s | бурь добавлено/обновлено: %s',
-    intervals.length, maxKp, CONFIG.MIN_KP, storms.length);
+  Logger.log('Календарь: «%s» | интервалов: %s | макс. Kp: %s | порог: %s | бурь найдено: %s, записано: %s',
+    cal.getName(), intervals.length, maxKp, CONFIG.MIN_KP, storms.length, ok);
+  if (!intervals.length) throw new Error('NOAA не вернул данных — проверьте журнал выше'); // чтобы сбой был виден в «Выполнениях»
 }
 
 /** Загружаем все источники и объединяем (при совпадении времени берём максимум Kp) */
@@ -226,12 +233,36 @@ function upsertEvent_(cal, storm) {
   }
 }
 
+let CAL_CACHE_ = null; // в пределах одного запуска календарь всегда один и тот же
+
+/**
+ * Рабочий календарь. Его ID сохраняется в свойствах скрипта, поэтому все вызовы
+ * (main, backfill2026 и т.д.) попадают в ОДИН календарь. Раньше календарь искался
+ * только по имени, а сразу после создания Google его по имени не находил —
+ * и скрипт создавал второй календарь с тем же названием (отсюда дубли).
+ */
 function getCalendar_() {
+  if (!CAL_CACHE_) CAL_CACHE_ = resolveCalendar_();
+  return CAL_CACHE_;
+}
+
+function resolveCalendar_() {
   if (!CONFIG.CALENDAR_NAME) return CalendarApp.getDefaultCalendar();
-  const found = CalendarApp.getCalendarsByName(CONFIG.CALENDAR_NAME);
-  if (found.length) return found[0];
-  const cal = CalendarApp.createCalendar(CONFIG.CALENDAR_NAME);
-  cal.setTimeZone(CONFIG.TIMEZONE);
+  const props = PropertiesService.getScriptProperties();
+  const savedId = props.getProperty('CALENDAR_ID');
+  let cal = savedId ? CalendarApp.getCalendarById(savedId) : null;
+  if (!cal) {
+    const found = CalendarApp.getCalendarsByName(CONFIG.CALENDAR_NAME);
+    cal = found.length ? found[0] : null;
+    if (!cal) {
+      cal = CalendarApp.createCalendar(CONFIG.CALENDAR_NAME);
+      cal.setTimeZone(CONFIG.TIMEZONE);
+    }
+    props.setProperty('CALENDAR_ID', cal.getId());
+  }
+  // Календарь, созданный скриптом, может быть скрыт или не отмечен галочкой в списке слева —
+  // события есть, но их не видно. Включаем отображение при каждом запуске.
+  try { cal.setHidden(false); cal.setSelected(true); } catch (e) { Logger.log('Не удалось включить отображение: %s', e.message); }
   return cal;
 }
 
@@ -267,10 +298,13 @@ function fetchGfz_(start, end) {
   const iso = d => Utilities.formatDate(d, 'UTC', "yyyy-MM-dd'T'HH:mm:ss'Z'");
   const url = 'https://kp.gfz.de/app/json/?start=' + iso(start) + '&end=' + iso(end) + '&index=Kp';
   const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  if (resp.getResponseCode() !== 200) throw new Error('GFZ: HTTP ' + resp.getResponseCode());
+  if (resp.getResponseCode() !== 200) {
+    throw new Error('GFZ: HTTP ' + resp.getResponseCode() + ' ' + resp.getContentText().slice(0, 200));
+  }
 
   const data = JSON.parse(resp.getContentText());
   const times = data.datetime || data.time || [];
+  if (!times.length) Logger.log('GFZ: пустой ответ, поля: %s', Object.keys(data).join(', '));
   const kps = data.Kp || [];
   const out = [];
   for (let i = 0; i < times.length; i++) {
@@ -280,6 +314,117 @@ function fetchGfz_(start, end) {
     out.push({ start: st, end: new Date(st.getTime() + 3 * 3600 * 1000), kp: kp });
   }
   return out;
+}
+
+/* ===================== ОЧИСТКА ДУБЛЕЙ ===================== */
+
+/**
+ * Ищет дубли среди СОБСТВЕННЫХ событий скрипта (по метке в описании) за 2026 год:
+ *  1) копии в основном календаре, если рабочий календарь — отдельный;
+ *  2) одинаковые события (то же время и название) внутри рабочего календаря.
+ * Ваши личные события не затрагиваются.
+ */
+function findDuplicates_() {
+  const from = new Date('2026-01-01T00:00:00Z');
+  const to = new Date('2027-01-01T00:00:00Z');
+  const target = getCalendar_();
+  const def = CalendarApp.getDefaultCalendar();
+  const ours = e => {
+    const d = e.getDescription() || '';
+    return d.indexOf(CONFIG.TAG) === 0 || d.indexOf(CONFIG.DAY_TAG) === 0;
+  };
+  const list = [];
+
+  if (def.getId() !== target.getId()) {
+    def.getEvents(from, to).filter(ours).forEach(e => list.push({ where: 'основной календарь', e: e }));
+  }
+  const seen = {};
+  target.getEvents(from, to).filter(ours).forEach(e => {
+    const key = e.getStartTime().getTime() + '|' + e.getEndTime().getTime() + '|' + e.getTitle();
+    if (seen[key]) list.push({ where: target.getName(), e: e });
+    else seen[key] = true;
+  });
+  return list;
+}
+
+/** Шаг 1: только показать, что будет удалено (ничего не удаляет) */
+function previewDuplicates() {
+  const list = findDuplicates_();
+  Logger.log('Будет удалено событий: %s', list.length);
+  list.forEach(x => Logger.log('  [%s] %s | %s', x.where, localStr_(x.e.getStartTime()), x.e.getTitle()));
+}
+
+/** Шаг 2: удалить найденные дубли */
+function removeDuplicates() {
+  const list = findDuplicates_();
+  list.forEach(x => { x.e.deleteEvent(); Utilities.sleep(100); });
+  Logger.log('Удалено событий: %s', list.length);
+}
+
+/**
+ * ПОЛНЫЙ СБРОС И ПЕРЕСБОРКА — запустите, если в календаре дубли или бардак.
+ * 1) удаляет ВСЕ календари с именем CONFIG.CALENDAR_NAME (даже если их несколько);
+ * 2) удаляет события скрипта (по метке) во всех ваших остальных календарях;
+ * 3) заново грузит историю 2026 (backfill2026) и актуальные бури (main).
+ * Ваши личные события в основном календаре не затрагиваются.
+ */
+function rebuildAll() {
+  // 0) сначала убеждаемся, что NOAA отвечает — иначе ничего не удаляем
+  if (!fetchAll_().length) throw new Error('NOAA не вернул данных — ничего не удалено, повторите позже');
+
+  let cals = 0, evs = 0;
+  const from = new Date('2026-01-01T00:00:00Z');
+  const to = new Date('2027-01-01T00:00:00Z');
+  const isOurs = e => {
+    const d = e.getDescription() || '';
+    return d.indexOf(CONFIG.TAG) === 0 || d.indexOf(CONFIG.DAY_TAG) === 0;
+  };
+  CalendarApp.getAllOwnedCalendars().forEach(c => {
+    if (CONFIG.CALENDAR_NAME && c.getName() === CONFIG.CALENDAR_NAME) {
+      c.deleteCalendar(); cals++; return;            // календарь скрипта удаляем целиком
+    }
+    c.getEvents(from, to).filter(isOurs).forEach(e => { e.deleteEvent(); evs++; }); // в остальных — только события скрипта
+  });
+  CAL_CACHE_ = null;
+  PropertiesService.getScriptProperties().deleteProperty('CALENDAR_ID');
+  Logger.log('Удалено календарей: %s | событий скрипта в основном календаре: %s', cals, evs);
+
+  Utilities.sleep(3000); // даём Google время обработать удаление
+
+  // 1) СНАЧАЛА актуальные и будущие бури — это главное
+  main();
+  // 2) потом история 2026; её сбой не должен ломать будущие события
+  try { backfill2026(); }
+  catch (e) { Logger.log('История 2026 не загружена: %s (актуальные бури уже добавлены)', e.message); }
+  Logger.log('Пересборка завершена');
+}
+
+/**
+ * Диагностика: запустите вручную и посмотрите журнал.
+ * Покажет Kp на ближайшие 48 ч (время Ростова), найденные бури, состояние календаря,
+ * события в нём и число триггеров. Ничего не создаёт и не удаляет.
+ */
+function diagnose() {
+  const now = new Date();
+  const intervals = fetchAll_().sort((a, b) => a.start - b.start);
+  const horizon = new Date(now.getTime() + 48 * 3600 * 1000);
+
+  Logger.log('Сейчас (Ростов): %s | часовой пояс проекта: %s', localStr_(now), Session.getScriptTimeZone());
+  Logger.log('Kp на ближайшие 48 ч (время Ростова), порог %s:', CONFIG.MIN_KP);
+  intervals.filter(i => i.end > now && i.start < horizon).forEach(i =>
+    Logger.log('  %s – %s | Kp %s %s', localStr_(i.start), localStr_(i.end), i.kp,
+      i.kp >= CONFIG.MIN_KP - 0.01 ? '← БУРЯ' : ''));
+  Logger.log('Бурь выше порога: %s', mergeStorms_(intervals).length);
+
+  const cal = getCalendar_();
+  Logger.log('Календарь «%s» (id %s) | скрыт: %s | отмечен: %s',
+    cal.getName(), cal.getId(), cal.isHidden(), cal.isSelected());
+  const evs = cal.getEvents(now, new Date(now.getTime() + 72 * 3600 * 1000));
+  Logger.log('Событий в календаре на 72 ч: %s', evs.length);
+  evs.forEach(e => Logger.log('  %s | %s', localStr_(e.getStartTime()), e.getTitle()));
+
+  const trig = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'main');
+  Logger.log('Триггеров для main(): %s %s', trig.length, trig.length ? '' : '← НЕТ ТРИГГЕРА, запустите createDailyTrigger()');
 }
 
 /** Запустить один раз. Бури меняются быстро, поэтому запуск каждые 3 часа */
